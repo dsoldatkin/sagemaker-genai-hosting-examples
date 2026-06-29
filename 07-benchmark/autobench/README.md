@@ -8,6 +8,7 @@ Configuration-driven LLM inference benchmarking across SageMaker Managed Inferen
 benchmarks.yaml (single source of truth)
        │
        ├── sdk/download_models.py         → Stage weights from HuggingFace to S3
+       ├── sdk/quantize_models.py         → Create AWQ/GPTQ checkpoints (GPU Processing Job)
        ├── sdk/benchmark.py               → SageMaker Managed Inference (FTP/reserved capacity)
        ├── sdk/benchmark_hyperpod.py      → HyperPod EKS (kubectl + direct-URL)
        └── sdk/benchmark_bedrock_byom.py  → Bedrock BYOM (Mantle API + RU reservations)
@@ -41,7 +42,7 @@ python benchmark_bedrock_byom.py --model=gemma # Bedrock BYOM
 
 | Path | Script | Deploy Method | Compute |
 |------|--------|---------------|---------|
-| **SageMaker MI** | `benchmark.py` | `create_model` → endpoint | FTP reserved capacity |
+| **SageMaker MI** | `benchmark.py` | `create_model` → endpoint | FTP reserved or on-demand |
 | **HyperPod EKS** | `benchmark_hyperpod.py` | `kubectl apply` → NLB | FTP node group |
 | **Bedrock BYOM** | `benchmark_bedrock_byom.py` | Mantle API import + RU reservation | AWS-managed |
 
@@ -71,6 +72,7 @@ models:
     instance_type: ml.p6-b200.48xlarge
     num_gpus: 8
     s3_model_uri: "s3://..."          # Pre-staged weights
+    endpoint_name: ""                  # Optional: benchmark a pre-existing endpoint (skip deploy)
     env:                               # SMAI: SM_VLLM_* env vars
       SM_VLLM_KV_CACHE_DTYPE: "fp8"
     hyperpod_args:                     # HyperPod: vLLM CLI args
@@ -81,6 +83,52 @@ models:
     byom:                              # Bedrock BYOM: import config
       base_model_id: "provider.model"
       model_id: ""                     # filled after import
+```
+
+### Capacity Modes (SMAI)
+
+SageMaker Managed Inference supports two capacity modes, controlled by the
+presence or absence of `ml_reservation_arn` in `sagemaker_defaults`:
+
+| Mode | Config | When to use |
+|------|--------|-------------|
+| **FTP reserved** | `ml_reservation_arn: arn:aws:sagemaker:...` | p-family instances with Training Plan |
+| **On-demand** | omit `ml_reservation_arn` | g-family instances or when no FTP available |
+
+On-demand mode simply omits the `CapacityReservationConfig` from the endpoint
+config. No code changes needed — just remove the ARN from your config.
+
+### Pre-existing Endpoints
+
+To benchmark an endpoint that was deployed outside of AutoBench (e.g., by
+another team member or via the console), set `endpoint_name` at the model level:
+
+```yaml
+models:
+  my-model:
+    model_name: org/Model-Name
+    instance_type: ml.g7e.24xlarge
+    endpoint_name: "my-existing-endpoint"  # skip deploy, benchmark directly
+```
+
+Or use the `--endpoint` CLI flag:
+
+```bash
+python benchmark.py --endpoint my-existing-endpoint --model=my-model
+```
+
+Both approaches skip deployment and cleanup — AutoBench only runs the
+benchmark jobs against the specified endpoint.
+
+### Model Weight Storage
+
+`download_models.py` stores weights in S3 using a normalized path derived from
+the HuggingFace model ID (not the config key). This prevents duplicate downloads
+when multiple config entries reference the same base model:
+
+```
+s3://<bucket>/models/google--gemma-4-31B-it/     ← one copy for all config variants
+s3://<bucket>/models/QuantTrio--gemma-4-31B-it-AWQ/
 ```
 
 ## Results Pipeline
@@ -123,7 +171,19 @@ All scripts support `--help` for full usage. Common flags:
 --submit            # Submit as unattended Processing Job (5-day timeout)
 --deploy-only       # Deploy endpoints/pods only (no benchmark)
 --benchmark-only    # Benchmark existing endpoints/pods
+--endpoint=<name>   # Benchmark a specific pre-existing endpoint (skip deploy)
 --cleanup           # Delete deployed resources
+```
+
+### Quantize Models
+
+Create pre-quantized checkpoints (AWQ INT4, GPTQ INT8) and upload to S3:
+
+```bash
+python quantize_models.py --validate                          # Show what needs quantizing
+python quantize_models.py --submit --region us-east-2         # Submit as GPU Processing Job
+python quantize_models.py --submit --method=awq               # AWQ only
+python quantize_models.py --method=gptq --region us-east-2    # Run locally (needs GPU)
 ```
 
 ### Backfill Options

@@ -284,15 +284,20 @@ def deploy_model(client, model_key, model_cfg, defaults):
         "ModelName": sm_model_name,
         "InstanceType": instance_type,
         "InitialInstanceCount": 1,
-        "InferenceAmiVersion": ami_version,
         "ModelDataDownloadTimeoutInSeconds": 1800,
         "ContainerStartupHealthCheckTimeoutInSeconds": 1800,
     }
+    # InferenceAmiVersion: include when explicitly set in config (applies to both
+    # FTP reserved and on-demand g7e deployments — Surya's team uses it on g7e)
+    if ami_version:
+        variant["InferenceAmiVersion"] = ami_version
     if training_plan_arn:
         variant["CapacityReservationConfig"] = {
             "MlReservationArn": training_plan_arn,
             "CapacityReservationPreference": "capacity-reservations-only",
         }
+    capacity_mode = "FTP reserved" if training_plan_arn else "on-demand"
+    print(f"  capacity: {capacity_mode}")
     client.create_endpoint_config(
         EndpointConfigName=ep_config_name,
         ProductionVariants=[variant],
@@ -405,9 +410,10 @@ def run_benchmark_job(client, job, ep_name, defaults, models=None):
         s3_output = f"s3://sagemaker-benchmark-{REGION}-{account}/managed-inference"
 
     # Hierarchical path: {env}/{model}/{workload}/{instance}/{timestamp}/
-    instance_short = defaults.get("ml_reservation_arn", "").split("/")[-1][:8] or "p6-b200"
+    instance_type_val = job.get("instance_type", "ml.p6-b200.48xlarge")
+    instance_short = instance_type_val.replace("ml.", "").split(".")[0]  # e.g. "p6-b200" or "g7e"
     timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
-    s3_job_path = f"{s3_output}/{job['model_key']}/{job['workload_key']}/p6-b200-c{job['concurrency']}/{timestamp}/"
+    s3_job_path = f"{s3_output}/{job['model_key']}/{job['workload_key']}/{instance_short}-c{job['concurrency']}/{timestamp}/"
 
     ts = datetime.now().strftime("%m%d%H%M")
     job_name = f"{job['id'][:50]}-{ts}".replace("_", "-")
@@ -498,7 +504,7 @@ def run_benchmark_job(client, job, ep_name, defaults, models=None):
             "output_tokens": job["output_tokens"],
             "streaming": job["streaming"],
             "duration": job["duration"],
-            "instance_type": "ml.p6-b200.48xlarge",
+            "instance_type": job.get("instance_type", "ml.p6-b200.48xlarge"),
             "num_gpus": job["num_gpus"],
             "vllm_config": defaults.get("vllm_config", {}),
             "image": defaults.get("sagemaker_image", "").format(region=REGION),
@@ -849,9 +855,15 @@ resume: re-run safely — completed jobs are skipped automatically
     for model_key, model_jobs in by_model.items():
         model_cfg = config["models"][model_key]
 
-        # Use explicit endpoint if provided (skips deploy/cleanup)
+        # Resolve endpoint: CLI --endpoint > model-level endpoint_name > deploy
+        # Model-level endpoint_name allows pointing at a pre-existing endpoint
+        # (e.g., deployed by Nick on EC2 or a live endpoint in another account)
+        model_endpoint = model_cfg.get("endpoint_name", "")
         if args.endpoint:
             ep_name_val = args.endpoint
+        elif model_endpoint:
+            ep_name_val = model_endpoint
+            print(f"\n  → Using pre-existing endpoint from config: {ep_name_val}")
         elif not args.benchmark_only:
             deploy_result = deploy_model(client, model_key, model_cfg, config.get("sagemaker_defaults", {}))
             if not deploy_result["success"]:
@@ -895,7 +907,7 @@ resume: re-run safely — completed jobs are skipped automatically
                 gaps.append({"model": model_key, "job": job["id"], **result["gap"]})
 
         # Cleanup after all workloads for this model (required for single-instance FTP)
-        if config.get("sagemaker_defaults", {}).get("cleanup", False) and not args.benchmark_only and not args.endpoint:
+        if config.get("sagemaker_defaults", {}).get("cleanup", False) and not args.benchmark_only and not args.endpoint and not model_endpoint:
             cleanup_model(client, model_key)
             wait_for_endpoint_deleted(client, endpoint_name(model_key))
             wait_for_ftp_available(client, config.get("sagemaker_defaults", {}))
