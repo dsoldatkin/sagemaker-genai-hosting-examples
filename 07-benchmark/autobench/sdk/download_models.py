@@ -66,14 +66,26 @@ def ensure_bucket(bucket, region):
             pass
 
 
+def _model_name_to_s3_key(model_name):
+    """Normalize a HuggingFace model ID to an S3-safe key.
+    e.g. 'google/gemma-4-31B-it' -> 'google--gemma-4-31B-it'
+    """
+    return model_name.replace("/", "--")
+
+
 def download_and_upload(model_key, model_name, region, account, prefix_base="models"):
-    """Download from HuggingFace and upload to S3."""
+    """Download from HuggingFace and upload to S3.
+
+    S3 prefix is derived from the HuggingFace model ID (not the config key)
+    so the same model isn't stored multiple times under different config names.
+    """
     bucket = f"sagemaker-benchmark-{region}-{account}"
-    prefix = f"{prefix_base}/{model_key}/"
+    s3_key = _model_name_to_s3_key(model_name)
+    prefix = f"{prefix_base}/{s3_key}/"
 
     # Skip if already present
     if check_s3_exists(bucket, prefix, region):
-        print(f"  ⏭️  {model_key} already in s3://{bucket}/{prefix}")
+        print(f"  ⏭️  {model_key} ({model_name}) already in s3://{bucket}/{prefix}")
         return f"s3://{bucket}/{prefix}"
 
     ensure_bucket(bucket, region)

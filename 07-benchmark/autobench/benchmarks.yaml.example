@@ -100,6 +100,7 @@ workloads:
 # GPU configuration:
 #   ml.p6-b200.48xlarge = 8× NVIDIA B200 GPUs → tensor_parallel_size=8
 #   ml.p5e.48xlarge     = 8× NVIDIA H100      → tensor_parallel_size=8
+#   ml.g7e.24xlarge     = 4× RTX PRO 6000     → tensor_parallel_size=4 (on-demand only, no FTP)
 
 models:
   # --- Example 1: Simple model (no special serving config) ---
@@ -167,6 +168,29 @@ models:
       - "--mm-encoder-tp-mode"
       - "data"
 
+  # --- Example 4: Pre-existing endpoint (skip deploy, benchmark only) ---
+  # Use this when someone else deployed the endpoint (e.g., from EC2 or console)
+  gemma-4-31b-external:
+    model_name: google/gemma-4-31B-it
+    instance_type: ml.g7e.24xlarge
+    num_gpus: 4
+    variant: external-deploy
+    endpoint_name: "my-teams-existing-endpoint"  # skip deploy, benchmark this directly
+    s3_model_uri: ""  # not needed — model already deployed
+
+  # --- Example 5: On-demand g7e with runtime FP8 quantization ---
+  # No FTP needed — just omit ml_reservation_arn from sagemaker_defaults
+  gemma-4-31b-fp8-g7e:
+    model_name: google/gemma-4-31B-it
+    deployment_config: transformers-vllm
+    instance_type: ml.g7e.24xlarge
+    num_gpus: 4
+    variant: fp8-dynamic
+    s3_model_uri: ""  # same base weights — vLLM quantizes at load time
+    env:
+      SM_VLLM_QUANTIZATION: "fp8"
+      SM_VLLM_KV_CACHE_DTYPE: "fp8"
+
 # ---------------------------------------------------------------------------
 # SageMaker Managed Inference Defaults
 # ---------------------------------------------------------------------------
@@ -177,6 +201,7 @@ sagemaker_defaults:
   sagemaker_image: 763104351884.dkr.ecr.{region}.amazonaws.com/vllm:0.20.2-gpu-py312-cu130-ubuntu22.04-sagemaker-v1.2
   inference_ami_version: al2023-ami-sagemaker-inference-gpu-4-1
   role_arn: arn:aws:iam::<ACCOUNT_ID>:role/<ROLE_NAME>
+  # FTP reserved capacity (p-family only). Omit this field for on-demand deployment (g-family, etc.)
   ml_reservation_arn: arn:aws:sagemaker:<REGION>:<ACCOUNT_ID>:training-plan/<TRAINING_PLAN_NAME>
   s3_output: s3://sagemaker-benchmark-{region}-<ACCOUNT_ID>/managed-inference
   vllm_config:
