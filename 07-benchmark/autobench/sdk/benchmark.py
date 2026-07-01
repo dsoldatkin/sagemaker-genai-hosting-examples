@@ -72,6 +72,7 @@ def expand_jobs(config, model_filter=None, workload_filter=None):
                     "duration": workload.get("duration", 300),
                     "warmup": workload.get("warmup", 30),
                     "dataset": workload.get("dataset"),
+                    "random_seed": workload.get("random_seed"),
                 })
     return jobs
 
@@ -193,29 +194,157 @@ def get_role_arn():
     return role
 
 
-def endpoint_name(model_key):
-    return f"bench-{model_key}"[:63]
+def endpoint_name(model_key=None):
+    """Shared endpoint name for the entire benchmark run.
+    The endpoint persists across model swaps; models deploy as inference components.
+    """
+    return "bench-autobench-ep"
 
 
 def ic_name(model_key):
     return f"bench-ic-{model_key}"[:63]
 
 
+def ensure_endpoint(client, defaults):
+    """Create the shared benchmark endpoint if it doesn't already exist.
+    The endpoint is instance-backed (no model) — models attach as inference components.
+    Returns the endpoint name.
+    """
+    ep_name = endpoint_name()
+    instance_type = defaults.get("endpoint_instance_type", "ml.p5e.48xlarge")
+    ami_version = defaults.get("inference_ami_version", "")
+    training_plan_arn = defaults.get("ml_reservation_arn")
+    role = defaults.get("role_arn") or get_role_arn()
+
+    # Check if endpoint already exists and is InService
+    try:
+        resp = client.describe_endpoint(EndpointName=ep_name)
+        status = resp["EndpointStatus"]
+        if status == "InService":
+            print(f"\n  ✓ Endpoint already InService: {ep_name}")
+            return ep_name
+        elif status in ("Creating", "Updating"):
+            print(f"\n  ⏳ Endpoint {status}, waiting...")
+            waiter = client.get_waiter("endpoint_in_service")
+            waiter.wait(EndpointName=ep_name, WaiterConfig={"Delay": 30, "MaxAttempts": 60})
+            print(f"  ✓ Endpoint InService: {ep_name}")
+            return ep_name
+        elif status == "Failed":
+            # Delete failed endpoint and recreate
+            print(f"  ⚠️  Endpoint in Failed state — deleting and recreating...")
+            client.delete_endpoint(EndpointName=ep_name)
+            wait_for_endpoint_deleted(client, ep_name)
+        else:
+            print(f"  ⚠️  Endpoint in {status} state — waiting for it to settle...")
+            time.sleep(30)
+    except client.exceptions.ClientError as e:
+        if "Could not find endpoint" not in str(e) and "ValidationException" not in str(e):
+            raise
+        # Endpoint doesn't exist — create it below
+
+    # Create endpoint config for a managed-instance endpoint (no model attached)
+    ep_config_name = f"{ep_name}-config"
+    try:
+        client.delete_endpoint_config(EndpointConfigName=ep_config_name)
+    except Exception:
+        pass
+
+    variant = {
+        "VariantName": "default",
+        "InstanceType": instance_type,
+        "InitialInstanceCount": 1,
+        "ModelDataDownloadTimeoutInSeconds": 1800,
+        "ContainerStartupHealthCheckTimeoutInSeconds": 1800,
+        "ManagedInstanceScaling": {
+            "Status": "ENABLED",
+            "MinInstanceCount": 1,
+            "MaxInstanceCount": 1,
+        },
+        "RoutingConfig": {
+            "RoutingStrategy": "LEAST_OUTSTANDING_REQUESTS",
+        },
+    }
+    if ami_version:
+        variant["InferenceAmiVersion"] = ami_version
+    if training_plan_arn:
+        variant["CapacityReservationConfig"] = {
+            "MlReservationArn": training_plan_arn,
+            "CapacityReservationPreference": "capacity-reservations-only",
+        }
+
+    capacity_mode = "FTP reserved" if training_plan_arn else "on-demand"
+    detailed_observability = defaults.get("monitoring", {}).get("detailed_observability", True)
+    print(f"\n{'='*60}")
+    print(f"[endpoint] Creating shared benchmark endpoint")
+    print(f"  name: {ep_name}")
+    print(f"  instance: {instance_type}")
+    print(f"  capacity: {capacity_mode}")
+    print(f"  detailed_observability: {detailed_observability}")
+    print(f"{'='*60}")
+
+    create_config_kwargs = {
+        "EndpointConfigName": ep_config_name,
+        "ExecutionRoleArn": role,
+        "ProductionVariants": [variant],
+    }
+    # Enable/disable detailed observability (enhanced IC-level metrics)
+    # Defaults to true for configs created after June 17, 2026, but we set explicitly
+    metrics_config = {
+        "EnableDetailedObservability": detailed_observability,
+        "EnableEnhancedMetrics": defaults.get("monitoring", {}).get("enhanced_metrics", True),
+    }
+    publish_frequency = defaults.get("monitoring", {}).get("publish_frequency_seconds")
+    if publish_frequency:
+        metrics_config["MetricPublishFrequencyInSeconds"] = int(publish_frequency)
+    create_config_kwargs["MetricsConfig"] = metrics_config
+
+    client.create_endpoint_config(**create_config_kwargs)
+    print(f"  ✓ Created endpoint config: {ep_config_name}")
+
+    client.create_endpoint(
+        EndpointName=ep_name,
+        EndpointConfigName=ep_config_name,
+    )
+    print(f"  ✓ Created endpoint: {ep_name}")
+
+    print(f"  ⏳ Waiting for endpoint InService...")
+    waiter = client.get_waiter("endpoint_in_service")
+    waiter.wait(EndpointName=ep_name, WaiterConfig={"Delay": 30, "MaxAttempts": 60})
+    print(f"  ✓ Endpoint InService: {ep_name}")
+    return ep_name
+
+
+def delete_endpoint(client):
+    """Delete the shared benchmark endpoint and its config. Called at end of run if cleanup=true."""
+    ep_name = endpoint_name()
+    ep_config_name = f"{ep_name}-config"
+    print(f"\n[cleanup] Deleting shared endpoint: {ep_name}")
+    try:
+        client.delete_endpoint(EndpointName=ep_name)
+        print(f"  ✓ Deleted endpoint: {ep_name}")
+    except Exception:
+        pass
+    try:
+        client.delete_endpoint_config(EndpointConfigName=ep_config_name)
+        print(f"  ✓ Deleted endpoint config: {ep_config_name}")
+    except Exception:
+        pass
+    wait_for_endpoint_deleted(client, ep_name)
+
+
 def deploy_model(client, model_key, model_cfg, defaults):
-    """Deploy using the AWS vLLM SageMaker DLC.
+    """Deploy a model as an inference component on the shared endpoint.
     Uses SM_VLLM_* env vars which map directly to vLLM CLI args.
     Image is already in ECR — no build needed.
     """
-    ep_name = endpoint_name(model_key)
-    ep_config_name = f"{ep_name}-config"
+    ep_name = endpoint_name()
+    component_name = ic_name(model_key)
     sm_model_name = f"bench-mdl-{model_key}"[:63]
     role = defaults.get("role_arn") or get_role_arn()
     instance_type = model_cfg["instance_type"]
     num_gpus = model_cfg.get("num_gpus", 1)
     region = defaults.get("region", REGION)
     image = defaults["sagemaker_image"].format(region=region)
-    ami_version = defaults.get("inference_ami_version", "al2-ami-sagemaker-inference-gpu-3-1")
-    training_plan_arn = defaults.get("ml_reservation_arn")
     model_id = model_cfg["model_name"]
     s3_model_uri = model_cfg.get("s3_model_uri", "")
 
@@ -240,17 +369,18 @@ def deploy_model(client, model_key, model_cfg, defaults):
         env_vars["HF_TOKEN"] = hf_token
 
     print(f"\n{'='*60}")
-    print(f"[deploy] {model_key}")
+    print(f"[deploy IC] {model_key}")
     print(f"  image: {image}")
     print(f"  instance: {instance_type} ({num_gpus} GPUs)")
     print(f"  model: {model_id}")
+    print(f"  endpoint: {ep_name}")
     if s3_model_uri:
         print(f"  source: {s3_model_uri} (S3)")
     else:
         print(f"  source: HuggingFace (direct download)")
     print(f"{'='*60}")
 
-    # 1. Create Model
+    # 1. Create SageMaker Model (container definition)
     try:
         client.delete_model(ModelName=sm_model_name)
     except Exception:
@@ -274,64 +404,62 @@ def deploy_model(client, model_key, model_cfg, defaults):
     )
     print(f"  ✓ Created model: {sm_model_name}")
 
-    # 2. Create endpoint config (with training plan for capacity)
+    # 2. Delete existing IC if present (from a previous failed run)
     try:
-        client.delete_endpoint_config(EndpointConfigName=ep_config_name)
+        client.delete_inference_component(InferenceComponentName=component_name)
+        print(f"  ⏳ Cleaning up stale IC: {component_name}")
+        _wait_for_ic_deleted(client, component_name)
     except Exception:
         pass
-    variant = {
-        "VariantName": "default",
+
+    # 3. Create Inference Component on the shared endpoint
+    compute_resources = {"NumberOfAcceleratorDevicesRequired": num_gpus}
+    # Optional compute constraints from model config
+    cr_overrides = model_cfg.get("compute_resources", {})
+    if cr_overrides.get("min_memory_mb"):
+        compute_resources["MinMemoryRequiredInMb"] = int(cr_overrides["min_memory_mb"])
+    if cr_overrides.get("max_memory_mb"):
+        compute_resources["MaxMemoryRequiredInMb"] = int(cr_overrides["max_memory_mb"])
+    if cr_overrides.get("num_cpu_cores"):
+        compute_resources["NumberOfCpuCoresRequired"] = float(cr_overrides["num_cpu_cores"])
+
+    ic_spec = {
         "ModelName": sm_model_name,
-        "InstanceType": instance_type,
-        "InitialInstanceCount": 1,
-        "ModelDataDownloadTimeoutInSeconds": 1800,
-        "ContainerStartupHealthCheckTimeoutInSeconds": 1800,
+        "StartupParameters": {
+            "ModelDataDownloadTimeoutInSeconds": 1800,
+            "ContainerStartupHealthCheckTimeoutInSeconds": 1800,
+        },
+        "ComputeResourceRequirements": compute_resources,
     }
-    # InferenceAmiVersion: include when explicitly set in config (applies to both
-    # FTP reserved and on-demand g7e deployments — Surya's team uses it on g7e)
-    if ami_version:
-        variant["InferenceAmiVersion"] = ami_version
-    if training_plan_arn:
-        variant["CapacityReservationConfig"] = {
-            "MlReservationArn": training_plan_arn,
-            "CapacityReservationPreference": "capacity-reservations-only",
-        }
-    capacity_mode = "FTP reserved" if training_plan_arn else "on-demand"
-    print(f"  capacity: {capacity_mode}")
-    client.create_endpoint_config(
-        EndpointConfigName=ep_config_name,
-        ProductionVariants=[variant],
+
+    client.create_inference_component(
+        InferenceComponentName=component_name,
+        EndpointName=ep_name,
+        VariantName="default",
+        Specification=ic_spec,
+        RuntimeConfig={
+            "CopyCount": 1,
+        },
     )
-    print(f"  ✓ Created endpoint config: {ep_config_name}")
+    print(f"  ✓ Created inference component: {component_name}")
+    print(f"    GPUs: {num_gpus}")
+    if cr_overrides:
+        print(f"    compute_resources: {cr_overrides}")
 
-    # 3. Create or update endpoint
-    try:
-        client.create_endpoint(
-            EndpointName=ep_name,
-            EndpointConfigName=ep_config_name,
-        )
-        print(f"  ✓ Created endpoint: {ep_name}")
-    except client.exceptions.ClientError as e:
-        if "Cannot create already existing" in str(e):
-            client.update_endpoint(EndpointName=ep_name, EndpointConfigName=ep_config_name)
-            print(f"  → Updated endpoint: {ep_name}")
-        else:
-            raise
-
-    # 4. Wait for InService
-    print(f"  ⏳ Waiting for endpoint InService...")
-    waiter = client.get_waiter("endpoint_in_service")
-    try:
-        waiter.wait(EndpointName=ep_name, WaiterConfig={"Delay": 30, "MaxAttempts": 60})
-    except Exception as e:
+    # 4. Wait for IC to be InService
+    print(f"  ⏳ Waiting for inference component InService...")
+    if not _wait_for_ic_in_service(client, component_name):
         try:
-            status = client.describe_endpoint(EndpointName=ep_name)["EndpointStatus"]
+            resp = client.describe_inference_component(InferenceComponentName=component_name)
+            status = resp.get("InferenceComponentStatus", "Unknown")
+            reason = resp.get("FailureReason", "")
         except Exception:
             status = "Unknown"
-        return {"success": False, "status": status, "error": f"Endpoint reached {status}: {e}"}
+            reason = ""
+        return {"success": False, "status": status, "error": f"IC reached {status}: {reason}"}
 
-    print(f"  ✓ Endpoint InService: {ep_name}")
-    return {"success": True, "endpoint": ep_name, "model_name": sm_model_name}
+    print(f"  ✓ Inference component InService: {component_name}")
+    return {"success": True, "endpoint": ep_name, "inference_component": component_name, "model_name": sm_model_name}
 
 
 # --- Inference Recommender (Advanced) ---
@@ -441,6 +569,10 @@ def run_benchmark_job(client, job, ep_name, defaults, models=None):
         },
         "tooling": {"api_standard": "openai"},
     }
+    # Random seed for reproducible synthetic dataset generation
+    # Same seed = identical prompts across runs (AIPerf hash-based RNG derivation)
+    if job.get("random_seed") is not None:
+        workload_spec["parameters"]["random_seed"] = job["random_seed"]
     # Only set public_dataset if a real dataset is specified (not "synthetic" or empty)
     if job.get("dataset") and job["dataset"].lower() != "synthetic":
         workload_spec["parameters"]["public_dataset"] = job["dataset"]
@@ -584,27 +716,62 @@ def classify_gap(error_str):
 # --- Cleanup ---
 
 def cleanup_model(client, model_key):
-    """Delete endpoint, endpoint config, and model."""
-    ep_name = endpoint_name(model_key)
-    ep_config_name = f"{ep_name}-config"
+    """Delete the inference component and SageMaker model for a given model.
+    The shared endpoint is NOT deleted — it persists for the next model.
+    """
+    component_name = ic_name(model_key)
     sm_model_name = f"bench-mdl-{model_key}"[:63]
 
-    print(f"\n[cleanup] {model_key}")
+    print(f"\n[cleanup IC] {model_key}")
     try:
-        client.delete_endpoint(EndpointName=ep_name)
-        print(f"  ✓ Deleted endpoint: {ep_name}")
+        client.delete_inference_component(InferenceComponentName=component_name)
+        print(f"  ✓ Deleted inference component: {component_name}")
     except Exception:
         pass
-    try:
-        client.delete_endpoint_config(EndpointConfigName=ep_config_name)
-        print(f"  ✓ Deleted endpoint config: {ep_config_name}")
-    except Exception:
-        pass
+    _wait_for_ic_deleted(client, component_name)
     try:
         client.delete_model(ModelName=sm_model_name)
         print(f"  ✓ Deleted model: {sm_model_name}")
     except Exception:
         pass
+
+
+def _wait_for_ic_in_service(client, component_name, timeout=1800):
+    """Poll until inference component reaches InService (or fails)."""
+    for i in range(timeout // 30):
+        try:
+            resp = client.describe_inference_component(InferenceComponentName=component_name)
+            status = resp.get("InferenceComponentStatus", "Unknown")
+            if status == "InService":
+                return True
+            if status in ("Failed",):
+                return False
+        except Exception:
+            pass
+        time.sleep(30)
+    return False
+
+
+def _wait_for_ic_deleted(client, component_name, timeout=300):
+    """Wait for inference component to be fully deleted before proceeding."""
+    print(f"  ⏳ Waiting for IC deletion: {component_name}")
+    for i in range(timeout // 15):
+        try:
+            resp = client.describe_inference_component(InferenceComponentName=component_name)
+            status = resp.get("InferenceComponentStatus", "Unknown")
+            if status == "Deleting":
+                time.sleep(15)
+                continue
+            # Still exists but not Deleting — wait a bit more
+            time.sleep(15)
+        except client.exceptions.ClientError as e:
+            if "Could not find" in str(e) or "ValidationException" in str(e) or "does not exist" in str(e):
+                print(f"  ✓ IC deleted: {component_name}")
+                return
+            time.sleep(15)
+        except Exception:
+            time.sleep(15)
+    print(f"  ⚠️  IC deletion not confirmed after {timeout}s — proceeding")
 
 
 def wait_for_endpoint_deleted(client, ep_name, timeout=300):
@@ -782,10 +949,10 @@ resume: re-run safely — completed jobs are skipped automatically
     parser.add_argument("--validate", action="store_true", help="Show expanded job matrix and exit (no AWS calls)")
     parser.add_argument("--model", help="Filter by model key substring (e.g. 'gemma', 'qwen3')")
     parser.add_argument("--workload", help="Filter by workload key substring (e.g. 'rag', 'chat')")
-    parser.add_argument("--deploy-only", action="store_true", help="Deploy model endpoints only, skip benchmarking")
-    parser.add_argument("--benchmark-only", action="store_true", help="Run benchmarks against already-deployed endpoints")
+    parser.add_argument("--deploy-only", action="store_true", help="Deploy endpoint + inference components only, skip benchmarking")
+    parser.add_argument("--benchmark-only", action="store_true", help="Run benchmarks against already-deployed ICs (skip deploy)")
     parser.add_argument("--endpoint", help="Run benchmarks against this specific endpoint name (skips deploy/cleanup, requires --model)")
-    parser.add_argument("--cleanup", action="store_true", help="Delete all deployed endpoints and models")
+    parser.add_argument("--cleanup", action="store_true", help="Delete all inference components, models, and the shared endpoint")
     parser.add_argument("--submit", action="store_true", help="Submit as a remote SageMaker Processing Job (no credential expiry, 5-day timeout)")
     args = parser.parse_args()
 
@@ -839,6 +1006,8 @@ resume: re-run safely — completed jobs are skipped automatically
         models = sorted(set(j["model_key"] for j in jobs))
         for m in models:
             cleanup_model(client, m)
+        # Also delete the shared endpoint when --cleanup is explicit
+        delete_endpoint(client)
         return
 
     # Group jobs by model
@@ -852,12 +1021,28 @@ resume: re-run safely — completed jobs are skipped automatically
     results = []
     gaps = []
 
+    # Ensure the shared endpoint is up before deploying any models
+    # (skip if user provides --endpoint or all models have endpoint_name set)
+    using_external_endpoint = args.endpoint or all(
+        config["models"][mk].get("endpoint_name", "") for mk in by_model
+    )
+    if not using_external_endpoint and not args.benchmark_only:
+        # Determine instance type: prefer sagemaker_defaults.endpoint_instance_type,
+        # fall back to first model's instance_type in the benchmark matrix
+        if not defaults_cfg.get("endpoint_instance_type"):
+            first_model_key = next(iter(by_model))
+            defaults_cfg["endpoint_instance_type"] = config["models"][first_model_key]["instance_type"]
+        try:
+            ensure_endpoint(client, defaults_cfg)
+        except Exception as e:
+            print(f"\n  ✗ Failed to create shared endpoint: {e}")
+            print(f"  Aborting — cannot proceed without endpoint.")
+            sys.exit(1)
+
     for model_key, model_jobs in by_model.items():
         model_cfg = config["models"][model_key]
 
-        # Resolve endpoint: CLI --endpoint > model-level endpoint_name > deploy
-        # Model-level endpoint_name allows pointing at a pre-existing endpoint
-        # (e.g., deployed by Nick on EC2 or a live endpoint in another account)
+        # Resolve endpoint: CLI --endpoint > model-level endpoint_name > deploy IC
         model_endpoint = model_cfg.get("endpoint_name", "")
         if args.endpoint:
             ep_name_val = args.endpoint
@@ -872,14 +1057,12 @@ resume: re-run safely — completed jobs are skipped automatically
                 print(f"  ✗ Deploy failed ({deploy_result.get('status', 'unknown')}) — skipping all workloads for {model_key}")
                 for j in model_jobs:
                     results.append({"id": j["id"], "status": "skipped", "reason": deploy_result["error"]})
-                # Always cleanup failed endpoint and wait for FTP before next model
+                # Cleanup the failed IC (endpoint stays up for next model)
                 cleanup_model(client, model_key)
-                wait_for_endpoint_deleted(client, endpoint_name(model_key))
-                wait_for_ftp_available(client, config.get("sagemaker_defaults", {}))
                 continue
-            ep_name_val = endpoint_name(model_key)
+            ep_name_val = endpoint_name()
         else:
-            ep_name_val = endpoint_name(model_key)
+            ep_name_val = endpoint_name()
 
         if args.deploy_only:
             continue
@@ -906,12 +1089,14 @@ resume: re-run safely — completed jobs are skipped automatically
             if result.get("gap"):
                 gaps.append({"model": model_key, "job": job["id"], **result["gap"]})
 
-        # Cleanup after all workloads for this model (required for single-instance FTP)
+        # Cleanup IC after all workloads for this model (frees GPU for next model)
         if config.get("sagemaker_defaults", {}).get("cleanup", False) and not args.benchmark_only and not args.endpoint and not model_endpoint:
             cleanup_model(client, model_key)
-            wait_for_endpoint_deleted(client, endpoint_name(model_key))
-            wait_for_ftp_available(client, config.get("sagemaker_defaults", {}))
 
+    # Optionally delete the shared endpoint at the very end
+    # (only if cleanup=true and we created it ourselves)
+    if config.get("sagemaker_defaults", {}).get("cleanup", False) and not args.benchmark_only and not using_external_endpoint:
+        delete_endpoint(client)
     # Write summary
     summary = {"run_id": run_id, "total": len(results),
                "completed": sum(1 for r in results if r.get("success")),
