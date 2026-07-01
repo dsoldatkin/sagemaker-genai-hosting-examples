@@ -1,4 +1,5 @@
 # =============================================================================
+# =============================================================================
 # SageMaker GenAI Inference Benchmarking — Configuration Template
 # =============================================================================
 # Copy this file to benchmarks.yaml and fill in your values.
@@ -85,6 +86,7 @@ workloads:
     dataset: blazedit_10k
     duration: 300
     warmup: 30
+    # random_seed: 42  # Set for reproducible synthetic datasets (same seed = identical prompts across runs)
 
 # ---------------------------------------------------------------------------
 # Model Deployments
@@ -96,6 +98,10 @@ workloads:
 #   hyperpod_args: vLLM CLI args (HyperPod EC2 image)
 #   hyperpod_env:  Pod env vars (HyperPod, non-SM_VLLM vars)
 #   byom:          Bedrock BYOM import config
+#
+# Cross-path optional fields:
+#   endpoint_name: Target an existing SMAI endpoint (skip deploy in benchmark.py)
+#   hyperpod_url:  Target an existing HyperPod/IO URL (skip deploy in benchmark_hyperpod.py)
 #
 # GPU configuration:
 #   ml.p6-b200.48xlarge = 8× NVIDIA B200 GPUs → tensor_parallel_size=8
@@ -142,6 +148,12 @@ models:
     variant: optimized-nvfp4-eagle3
     benchmark_tokenizer: Qwen/Qwen2.5-7B  # Proxy tokenizer for AIPerf (model's own requires trust_remote_code)
     s3_model_uri: ""  # fill after download
+    # Optional: IC compute resource constraints (only num_gpus is required)
+    # Maps to InferenceComponentComputeResourceRequirements
+    compute_resources:
+      min_memory_mb: 614400      # minimum MB reserved for this IC (~600GB)
+      max_memory_mb: 1290240     # maximum MB cap (8× B200 = 1.2TB)
+      # num_cpu_cores: 192       # optional CPU cores allocation
     # SMAI
     env:
       VLLM_USE_FLASHINFER_MOE_FP4: "1"
@@ -170,12 +182,14 @@ models:
 
   # --- Example 4: Pre-existing endpoint (skip deploy, benchmark only) ---
   # Use this when someone else deployed the endpoint (e.g., from EC2 or console)
+  # endpoint_name → for SMAI (benchmark.py); hyperpod_url → for HyperPod (benchmark_hyperpod.py)
   gemma-4-31b-external:
     model_name: google/gemma-4-31B-it
     instance_type: ml.g7e.24xlarge
     num_gpus: 4
     variant: external-deploy
     endpoint_name: "my-teams-existing-endpoint"  # skip deploy, benchmark this directly
+    hyperpod_url: "http://k8s-benchmar-abc123.us-east-2.elb.amazonaws.com/v1"  # OR: skip deploy on HyperPod
     s3_model_uri: ""  # not needed — model already deployed
 
   # --- Example 5: On-demand g7e with runtime FP8 quantization ---
@@ -197,9 +211,10 @@ models:
 sagemaker_defaults:
   region: <REGION>
   deployment_target: managed-inference
-  cleanup: true  # cleanup between models (single instance via FTP)
+  cleanup: true  # cleanup ICs between models (endpoint stays up)
   sagemaker_image: 763104351884.dkr.ecr.{region}.amazonaws.com/vllm:0.20.2-gpu-py312-cu130-ubuntu22.04-sagemaker-v1.2
   inference_ami_version: al2023-ami-sagemaker-inference-gpu-4-1
+  endpoint_instance_type: ml.p5e.48xlarge  # shared endpoint instance type
   role_arn: arn:aws:iam::<ACCOUNT_ID>:role/<ROLE_NAME>
   # FTP reserved capacity (p-family only). Omit this field for on-demand deployment (g-family, etc.)
   ml_reservation_arn: arn:aws:sagemaker:<REGION>:<ACCOUNT_ID>:training-plan/<TRAINING_PLAN_NAME>
@@ -207,6 +222,13 @@ sagemaker_defaults:
   vllm_config:
     max_model_len: "16384"
     gpu_memory_utilization: "0.9"
+  # Enhanced IC monitoring (detailed observability + enhanced metrics)
+  # Publishes per-IC GPU utilization, token latency, and framework-level metrics to CloudWatch
+  # See: https://docs.aws.amazon.com/sagemaker/latest/dg/monitoring-cloudwatch-enhanced-metrics.html
+  monitoring:
+    detailed_observability: true  # OTel framework metrics (vLLM token latency, KV cache, etc.)
+    enhanced_metrics: true        # instance/container-level GPU, CPU, memory with InstanceId + AcceleratorId dims
+    publish_frequency_seconds: 10 # valid: 10, 30, 60, 120, 180, 240, 300 (default: 60)
 
 sagemaker_benchmarks:
   - model: gemma-4-31b-vllm

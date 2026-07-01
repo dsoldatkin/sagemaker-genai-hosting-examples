@@ -120,6 +120,25 @@ python benchmark.py --endpoint my-existing-endpoint --model=my-model
 Both approaches skip deployment and cleanup — AutoBench only runs the
 benchmark jobs against the specified endpoint.
 
+### Pre-existing HyperPod Deployments
+
+To benchmark a model deployed on HyperPod outside of AutoBench (e.g., via the
+Inference Operator, manual kubectl, or any method that produces a reachable URL),
+set `hyperpod_url` at the model level:
+
+```yaml
+models:
+  my-model:
+    model_name: org/Model-Name
+    instance_type: ml.p6-b200.48xlarge
+    num_gpus: 8
+    hyperpod_url: "http://k8s-benchmar-abc123.us-east-2.elb.amazonaws.com/v1"
+```
+
+This skips kubectl deploy and cleanup — AutoBench passes the URL directly to the
+AI Benchmark Job. Works with `--submit` (the Processing Job uses `vpc_config` to
+reach the internal NLB).
+
 ### Model Weight Storage
 
 `download_models.py` stores weights in S3 using a normalized path derived from

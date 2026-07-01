@@ -746,8 +746,13 @@ note:   single p6-b200 node — models are deployed sequentially with cleanup be
     for model_key, model_jobs in by_model.items():
         model_cfg = config["models"][model_key]
 
-        # Deploy
-        if not args.benchmark_only:
+        # Resolve URL: model-level hyperpod_url > deploy > kubectl lookup
+        # hyperpod_url allows benchmarking a pre-existing deployment (e.g., via Inference Operator)
+        model_url = model_cfg.get("hyperpod_url", "")
+        if model_url:
+            elb_url = model_url
+            print(f"\n  → Using pre-existing URL from config: {elb_url}")
+        elif not args.benchmark_only:
             deploy_result = deploy_model_k8s(model_key, model_cfg, defaults)
             if not deploy_result["success"]:
                 print(f"  ✗ Deploy failed: {deploy_result['error']}")
@@ -787,7 +792,7 @@ note:   single p6-b200 node — models are deployed sequentially with cleanup be
             (run_dir / f"{job['id']}.json").write_text(json.dumps(result, indent=2, default=str))
 
         # Cleanup between models (single node)
-        if defaults.get("cleanup", True) and not args.benchmark_only:
+        if defaults.get("cleanup", True) and not args.benchmark_only and not model_url:
             cleanup_model_k8s(model_key, defaults)
             time.sleep(30)
 
