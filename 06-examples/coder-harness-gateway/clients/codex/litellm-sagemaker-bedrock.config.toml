@@ -1,0 +1,12 @@
+# Copy into ~/.codex/config.toml, or use as a temporary CODEX_HOME/config.toml
+# for tests. This points Codex at the local LiteLLM gateway.
+
+model_provider = "coder-litellm"
+model = "coding-default"
+model_context_window = 32768
+
+[model_providers.coder-litellm]
+name = "Coder LiteLLM Gateway"
+base_url = "http://127.0.0.1:4000/v1"
+env_key = "LITELLM_API_KEY"
+wire_api = "responses"

@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -euxo pipefail
+
+exec > >(tee -a /var/log/coder-gateway-bootstrap.log) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update
+apt-get install -y ca-certificates curl jq
+
+if ! command -v docker >/dev/null 2>&1; then
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+fi
+
+systemctl enable docker
+systemctl start docker
+
+mkdir -p /opt/coder-gateway /opt/hf-cache
+chmod 755 /opt/coder-gateway
+
+cat >/opt/coder-gateway/litellm.yaml <<'YAML'
+model_list:
+  - model_name: coding-local
+    litellm_params:
+      model: openai/coding-local
+      api_base: http://127.0.0.1:${vllm_port}/v1
+      api_key: EMPTY
+
+  - model_name: coding-fast
+    litellm_params:
+      model: openai/coding-local
+      api_base: http://127.0.0.1:${vllm_port}/v1
+      api_key: EMPTY
+
+  - model_name: coding-default
+    litellm_params:
+      model: openai/coding-local
+      api_base: http://127.0.0.1:${vllm_port}/v1
+      api_key: EMPTY
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 240
+  num_retries: 1
+
+general_settings:
+  master_key: ${litellm_master_key}
+YAML
+
+cat >/etc/systemd/system/vllm-coder.service <<'UNIT'
+[Unit]
+Description=vLLM OpenAI server for coder model
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Restart=always
+RestartSec=20
+TimeoutStartSec=0
+Environment=HUGGING_FACE_HUB_TOKEN=${hugging_face_hub_token}
+ExecStartPre=-/usr/bin/docker rm -f vllm-coder
+ExecStartPre=/usr/bin/docker pull ${vllm_image}
+ExecStart=/usr/bin/docker run --rm --name vllm-coder --gpus all --ipc=host --network=host \
+  -e HUGGING_FACE_HUB_TOKEN \
+  -v /opt/hf-cache:/root/.cache/huggingface \
+  ${vllm_image} \
+  --host 0.0.0.0 \
+  --port ${vllm_port} \
+  --model ${model_id} \
+  --served-model-name ${served_model_name} \
+  --max-model-len ${max_model_len} \
+  --gpu-memory-utilization ${gpu_memory_utilization} \
+  --enable-auto-tool-choice \
+  --tool-call-parser hermes
+ExecStop=/usr/bin/docker stop vllm-coder
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat >/etc/systemd/system/litellm-gateway.service <<'UNIT'
+[Unit]
+Description=LiteLLM gateway for coding harnesses
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Restart=always
+RestartSec=10
+TimeoutStartSec=0
+Environment=LITELLM_MASTER_KEY=${litellm_master_key}
+ExecStartPre=-/usr/bin/docker rm -f litellm-gateway
+ExecStartPre=/usr/bin/docker pull ${litellm_image}
+ExecStart=/usr/bin/docker run --rm --name litellm-gateway --network=host \
+  -e LITELLM_MASTER_KEY \
+  -v /opt/coder-gateway/litellm.yaml:/app/config.yaml:ro \
+  ${litellm_image} \
+  --config /app/config.yaml \
+  --host 0.0.0.0 \
+  --port ${gateway_port}
+ExecStop=/usr/bin/docker stop litellm-gateway
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable vllm-coder.service litellm-gateway.service
+systemctl start vllm-coder.service
+systemctl start litellm-gateway.service
+
+cat >/opt/coder-gateway/README.txt <<'EOF'
+Useful commands:
+  journalctl -u vllm-coder -f
+  journalctl -u litellm-gateway -f
+  curl http://127.0.0.1:8000/v1/models
+  curl http://127.0.0.1:4000/v1/models -H "Authorization: Bearer <gateway key>"
+EOF
