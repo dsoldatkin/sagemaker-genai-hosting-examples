@@ -1,0 +1,50 @@
+# LiteLLM gateway config for coding harnesses.
+# Backends:
+# - coding-local: SageMaker vLLM endpoint through scripts/sagemaker_openai_adapter.py
+# - coding-gpt: OpenAI GPT OSS on Bedrock
+# - coding-opus: Claude Opus on Bedrock
+# - coding-default: local first, then GPT, then Opus fallback
+
+model_list:
+  - model_name: coding-local
+    litellm_params:
+      model: openai/coding-local
+      api_base: http://127.0.0.1:8088/v1
+      api_key: os.environ/SAGEMAKER_ADAPTER_API_KEY
+
+  - model_name: coding-default
+    litellm_params:
+      model: openai/coding-local
+      api_base: http://127.0.0.1:8088/v1
+      api_key: os.environ/SAGEMAKER_ADAPTER_API_KEY
+
+  - model_name: coding-gpt
+    litellm_params:
+      model: bedrock/openai.gpt-oss-120b-1:0
+      aws_region_name: os.environ/AWS_REGION
+
+  - model_name: coding-opus
+    litellm_params:
+      model: bedrock/us.anthropic.claude-opus-4-5-20251101-v1:0
+      aws_region_name: os.environ/AWS_REGION
+
+  - model_name: coding-strong
+    litellm_params:
+      model: bedrock/us.anthropic.claude-opus-4-5-20251101-v1:0
+      aws_region_name: os.environ/AWS_REGION
+
+router_settings:
+  routing_strategy: latency-based-routing
+  fallbacks:
+    - coding-default: [coding-gpt, coding-opus]
+    - coding-local: [coding-gpt, coding-opus]
+    - coding-gpt: [coding-opus]
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 240
+  num_retries: 1
+  set_verbose: false
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

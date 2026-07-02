@@ -1,0 +1,42 @@
+# Example LiteLLM Proxy configuration.
+# Replace model IDs, keys, and AWS region before use.
+
+model_list:
+  - model_name: coding-local
+    litellm_params:
+      model: openai/coding-local
+      api_base: http://vllm-g6e.internal:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+
+  - model_name: coding-fast
+    litellm_params:
+      model: openai/coding-local
+      api_base: http://vllm-g6e.internal:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+
+  - model_name: coding-strong
+    litellm_params:
+      model: bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0
+      aws_region_name: us-east-1
+
+  - model_name: coding-default
+    litellm_params:
+      model: openai/coding-local
+      api_base: http://vllm-g6e.internal:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+
+router_settings:
+  fallbacks:
+    - coding-default: [coding-strong]
+    - coding-local: [coding-strong]
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 180
+  num_retries: 2
+  success_callback: []
+  failure_callback: []
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/LITELLM_DATABASE_URL

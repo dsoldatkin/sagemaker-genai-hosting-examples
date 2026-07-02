@@ -1,0 +1,13 @@
+# User-level Codex config example.
+# Copy the relevant block into ~/.codex/config.toml.
+
+model_provider = "coder-gateway"
+model = "coding-default"
+
+[model_providers.coder-gateway]
+name = "Coder Harness Gateway"
+base_url = "https://llm-gateway.example.com/v1"
+env_key = "LITELLM_API_KEY"
+wire_api = "responses"
+
+# Codex 0.136+ requires Responses-compatible providers.
