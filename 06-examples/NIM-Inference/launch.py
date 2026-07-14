@@ -11,7 +11,7 @@ from sagemaker.base_deserializers import StreamDeserializer
 from sagemaker.predictor import Predictor
 from sagemaker.session import Session
 from sagemaker.serializers import JSONSerializer
-from jinja2 import Environment, FileSystemLoader, TemplateNotFound
+from jinja2 import Environment, FileSystemLoader, TemplateNotFound, select_autoescape
 from botocore.exceptions import ClientError
 from docker import APIClient, errors
 
@@ -59,7 +59,7 @@ def docker_build_and_push(dockerfile, tags):
     if missing_files:
         logger.error(f"Missing required files for Docker build: {missing_files}")
         sys.exit(1)
-    
+
     logger.info("All required files are present for Docker build.")
 
     # Build the Docker image
@@ -169,7 +169,7 @@ def create_shim_image():
     docker_pull(SRC_IMAGE_PATH)
 
     # Load Dockerfile template and replace placeholder
-    env = Environment(loader=FileSystemLoader('.'))
+    env = Environment(loader=FileSystemLoader('.'), autoescape=select_autoescape(['html', 'xml']))
     template = env.get_template('Dockerfile')  # Ensure your template is named Dockerfile.j2
     dockerfile_content = template.render(SRC_IMAGE=SRC_IMAGE_PATH)
 
@@ -182,7 +182,7 @@ def create_shim_image():
     if missing_files:
         logger.error(f"Missing required files for Docker build: {missing_files}")
         sys.exit(1)
-    
+
     logger.info("All required files are present for Docker build.")
     logger.info("Dockerfile.nim content:")
     with open('Dockerfile.nim', 'r') as f:
@@ -296,13 +296,13 @@ def render_template(template_file, output_file, context):
     template_name = os.path.basename(template_file)
 
     # Set up the Jinja2 environment with the determined template directory
-    env = Environment(loader=FileSystemLoader(template_dir))
-    
+    env = Environment(loader=FileSystemLoader(template_dir), autoescape=select_autoescape(['html', 'xml']))
+
     try:
         # Load and render the template
         template = env.get_template(template_name)
         rendered_content = template.render(context)
-        
+
         # Write the rendered content to the output file
         with open(output_file, 'w') as f:
             f.write(rendered_content)
@@ -405,10 +405,10 @@ def test_apicat_endpoint(print_raw, api_url, api_key):
             "content-type": "application/json",
             "authorization": f"Bearer {api_key}"
         }
-        
+
         start_time = time.time()
         response = requests.post(api_url, json=test_payload_json, headers=headers, stream=True)
-        
+
         if response.status_code != 200:
             print(f"Error: {response.status_code} - {response.text}")
             return
@@ -439,7 +439,7 @@ def test_apicat_endpoint(print_raw, api_url, api_key):
                             print(content, end='', flush=True)
                     except json.JSONDecodeError:
                         continue
-        
+
         duration = time.time() - start_time
         print(f"\nInvocation of API endpoint took {duration:.2f} seconds.", flush=True)
 
@@ -472,10 +472,10 @@ def test_local_endpoint(print_raw, api_url):
             "accept": "application/json",
             "content-type": "application/json"
         }
-        
+
         start_time = time.time()
         response = requests.post(api_url, json=test_payload_json, headers=headers, stream=True)
-        
+
         if response.status_code != 200:
             print(f"Error: {response.status_code} - {response.text}")
             return
@@ -506,7 +506,7 @@ def test_local_endpoint(print_raw, api_url):
                             print(content, end='', flush=True)
                     except json.JSONDecodeError:
                         continue
-        
+
         duration = time.time() - start_time
         print(f"\nInvocation of API endpoint took {duration:.2f} seconds.", flush=True)
 
